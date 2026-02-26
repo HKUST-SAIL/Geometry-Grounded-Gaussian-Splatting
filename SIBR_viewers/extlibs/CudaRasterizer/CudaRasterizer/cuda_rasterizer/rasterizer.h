@@ -124,7 +124,6 @@ public:
         const float scale_modifier,
         const float* rotations,
         const float* cov3D_precomp,
-        const float* depths_plane_precomp,
         const float* viewmatrix,
         const float* projmatrix,
         const float* cam_pos,
@@ -134,7 +133,6 @@ public:
         const bool prefiltered,
         float* out_transmittance,
         bool* inside,
-        bool* condition = nullptr,
         bool debug      = false);
 
     static int evaluateSDF(
@@ -153,7 +151,6 @@ public:
         const float scale_modifier,
         const float* rotations,
         const float* cov3D_precomp,
-        const float* depths_plane_precomp,
         const float* viewmatrix,
         const float* projmatrix,
         const float* cam_pos,
@@ -164,8 +161,41 @@ public:
         float* out_depth,
         float* out_sdf,
         bool* inside,
-        bool* condition = nullptr,
         bool debug      = false);
+
+    static int evaluateColor(
+        std::function<char*(size_t)> geometryBuffer,
+        std::function<char*(size_t)> binningBuffer,
+        std::function<char*(size_t)> pointBuffer,
+        std::function<char*(size_t)> point_binningBuffer,
+        std::function<char*(size_t)> tileBuffer,
+        std::function<char*(size_t)> duplicatedTileBuffer,
+        const int PN, const int P,
+        const int SHD, const int SHM, const int SGD, const int SGM,
+        const float* background,
+        const int width, const int height,
+        const float* points3D,
+        const float* means3D,
+        const float* colors_precomp,
+        const float* opacities,
+        const float* scales,
+        const float* rotations,
+        const float* cov3D_precomp,
+        const float* shs,
+        const float* sg_axis,
+        const float* sg_sharpness,
+        const float* sg_color,
+        const float scale_modifier,
+        const float* viewmatrix,
+        const float* projmatrix,
+        const float* cam_pos,
+        const float tan_fovx,
+        const float tan_fovy,
+        const float kernel_size,
+        const bool prefiltered,
+        float* out_color,
+        bool* inside,
+        bool debug = false);
 
     static int3 sampleDepth(
         std::function<char*(size_t)> geometryBuffer,

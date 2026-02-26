@@ -9,7 +9,12 @@ import trimesh
 from tqdm import tqdm
 
 from arguments import ModelParams, PipelineParams, get_combined_args
-from gaussian_renderer import GaussianModel, evaluate_sdf, integrate
+from gaussian_renderer import (
+    GaussianModel,
+    evaluate_transmittance,
+    evaluate_sdf,
+    evaluate_color,
+)
 from scene import Scene
 from tetranerf.utils.extension import cpp
 from utils.tetmesh import marching_tetrahedra
@@ -21,10 +26,16 @@ def post_process_mesh(mesh, cluster_to_keep=1):
     """
     import copy
 
-    print("post processing the mesh to have {} clusterscluster_to_kep".format(cluster_to_keep))
+    print(
+        "post processing the mesh to have {} clusterscluster_to_kep".format(
+            cluster_to_keep
+        )
+    )
     mesh_0 = copy.deepcopy(mesh)
     with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Debug) as cm:
-        triangle_clusters, cluster_n_triangles, cluster_area = mesh_0.cluster_connected_triangles()
+        triangle_clusters, cluster_n_triangles, cluster_area = (
+            mesh_0.cluster_connected_triangles()
+        )
 
     triangle_clusters = np.asarray(triangle_clusters)
     cluster_n_triangles = np.asarray(cluster_n_triangles)
@@ -54,56 +65,133 @@ def evaluation_validation(view, points, inside):
                 (view.Cy * 2.0 + 1.0) / view.image_height - 1.0,
             ]
         ),
-        pts2d.new_tensor([view.Fx * 2.0 / view.image_width, view.Fy * 2.0 / view.image_height]),
+        pts2d.new_tensor(
+            [view.Fx * 2.0 / view.image_width, view.Fy * 2.0 / view.image_height]
+        ),
         pts2d,
     )
-    sampled_mask = torch.nn.functional.grid_sample(view.gt_mask[None].cuda(), pts2d[None, None], align_corners=True)
+    sampled_mask = torch.nn.functional.grid_sample(
+        view.gt_mask[None].cuda(), pts2d[None, None], align_corners=True
+    )
     return (sampled_mask.squeeze() > 0.5) & inside
 
 
 @torch.no_grad()
-def evaluage_alpha_cull(points, views, gaussians, pipeline, kernel_size):
-    # final_weight = torch.ones(points.shape[0], dtype=torch.float32, device="cuda")
-    # any_valid = torch.zeros(points.shape[0], dtype=torch.bool, device="cuda")
+def evaluate_alpha_cull(points, views, gaussians, pipeline, kernel_size):
     final_sdf = []
     any_valid = []
     chunk_size = 10000000
     for point_chunk in torch.chunk(points, points.shape[0] // chunk_size + 1):
-        final_weight_chunk = torch.ones(point_chunk.shape[0], dtype=torch.float32, device="cuda")
-        any_valid_chunk = torch.zeros(point_chunk.shape[0], dtype=torch.bool, device="cuda")
+        final_weight_chunk = torch.zeros(
+            point_chunk.shape[0], dtype=torch.float32, device="cuda"
+        )
+        any_valid_chunk = torch.zeros(
+            point_chunk.shape[0], dtype=torch.bool, device="cuda"
+        )
         for view in tqdm(views, desc="Rendering progress"):
-            ret = integrate(point_chunk, view, gaussians, pipeline, kernel_size)
+            ret = evaluate_transmittance(
+                point_chunk, view, gaussians, pipeline, kernel_size
+            )
             valid_points = evaluation_validation(view, point_chunk, ret["inside"])
             any_valid_chunk = torch.logical_or(any_valid_chunk, valid_points)
             final_weight_chunk = torch.where(
                 valid_points,
-                torch.min(ret["alpha_integrated"], final_weight_chunk),
+                torch.max(ret["transmittance"], final_weight_chunk),
                 final_weight_chunk,
             )
         final_weight_chunk[torch.logical_not(any_valid_chunk)] = 0
-        final_sdf_chunk = 0.5 - final_weight_chunk
+        final_sdf_chunk = final_weight_chunk - 0.5
         final_sdf.append(final_sdf_chunk)
         any_valid.append(any_valid_chunk)
     return torch.cat(final_sdf), torch.cat(any_valid)
 
 
-# @torch.no_grad()
-# def evaluage_sdf_cull(points, views, gaussians, pipeline, kernel_size, max_dist=0.0008):
-#     surface_points = []
-#     chunk_size = 20000000
-#     for point_chunk in torch.chunk(points, points.shape[0] // chunk_size + 1):
-#         surface_points_chunk = torch.zeros(point_chunk.shape[0], dtype=torch.bool, device="cuda")
-#         for view in tqdm(views, desc="Rendering progress"):
-#             ret = evaluate_sdf(point_chunk, view, gaussians, pipeline, kernel_size)
-#             sdf = ret["sdf"]
-#             valid_points = evaluation_validation(view, point_chunk, ret["inside"])
-#             surface_points_chunk = torch.where(valid_points, surface_points_chunk | (sdf.abs() < max_dist), surface_points_chunk)
-#         surface_points.append(surface_points_chunk)
-#     return torch.cat(surface_points)
+@torch.no_grad()
+def add_color(
+    points, views, gaussians, pipeline, kernel_size, background, max_dist=0.008
+):
+    surface_points = []
+    chunk_size = 10000000
+    accumulated_colors = []
+    for point_chunk in torch.chunk(points, points.shape[0] // chunk_size + 1):
+        n_points = point_chunk.shape[0]
+        accumulated_colors_chunk = torch.zeros(
+            (n_points, 3), dtype=torch.float32, device="cuda"
+        )
+        accumulated_points_chunk = torch.zeros(
+            n_points, dtype=torch.int32, device="cuda"
+        )
+        for view in tqdm(views, desc="Rendering progress"):
+            transmittance = evaluate_transmittance(
+                point_chunk, view, gaussians, pipeline, kernel_size
+            )["transmittance"]
+            ret = evaluate_sdf(point_chunk, view, gaussians, pipeline, kernel_size)
+            sdf = ret["sdf"]
+            valid_points = (
+                evaluation_validation(view, point_chunk, ret["inside"])
+                & (sdf.abs() < max_dist)
+                & (transmittance > 0.2)
+            )
+            color = evaluate_color(
+                point_chunk, view, gaussians, pipeline, kernel_size, background
+            )["color"]
+            accumulated_colors_chunk = torch.where(
+                valid_points.unsqueeze(-1),
+                accumulated_colors_chunk + color,
+                accumulated_colors_chunk,
+            )
+            accumulated_points_chunk = torch.where(
+                valid_points, accumulated_points_chunk + 1, accumulated_points_chunk
+            )
+        accumulated_colors.append(
+            accumulated_colors_chunk
+            / accumulated_points_chunk.unsqueeze(-1).type(torch.float32)
+        )
+        surface_points.append(accumulated_points_chunk > 0)
+    return torch.cat(accumulated_colors), torch.cat(surface_points)
 
 
 @torch.no_grad()
-def marching_tetrahedra_with_binary_search(model_path, views, gaussians, pipeline, kernel_size, move_cpu, num_cluster):
+def add_color_silhouette(points, views, gaussians, pipeline, kernel_size, background):
+    chunk_size = 10000000
+    colors = []
+    for point_chunk in torch.chunk(points, points.shape[0] // chunk_size + 1):
+        n_points = point_chunk.shape[0]
+        colors_chunk = torch.full(
+            (n_points, 3), 0.5, dtype=torch.float32, device="cuda"
+        )
+        transmittance_chunk = torch.zeros(n_points, dtype=torch.int32, device="cuda")
+        for view in tqdm(views, desc="Rendering progress"):
+            ret = evaluate_transmittance(
+                point_chunk, view, gaussians, pipeline, kernel_size
+            )
+            transmittance = ret["transmittance"]
+            valid_points = evaluation_validation(view, point_chunk, ret["inside"])
+            color = evaluate_color(
+                point_chunk, view, gaussians, pipeline, kernel_size, background
+            )["color"]
+            update = (transmittance > transmittance_chunk) & valid_points
+            colors_chunk = torch.where(update.unsqueeze(-1), color, colors_chunk)
+            transmittance_chunk = torch.where(
+                update, transmittance, transmittance_chunk
+            )
+        colors.append(colors_chunk)
+
+    return torch.cat(colors)
+
+
+@torch.no_grad()
+def marching_tetrahedra_with_binary_search(
+    model_path,
+    views,
+    gaussians,
+    pipeline,
+    kernel_size,
+    background,
+    export_color,
+    move_cpu,
+    num_cluster,
+):
     # generate tetra points here
     points, points_scale = gaussians.get_tetra_points()
 
@@ -120,19 +208,29 @@ def marching_tetrahedra_with_binary_search(model_path, views, gaussians, pipelin
     #     # we should filter the cell if it is larger than the gaussians
     #     torch.save(cells, os.path.join(model_path, "cells.pt"))
 
-    sdf, valid = evaluage_alpha_cull(points, views, gaussians, pipeline, kernel_size)
+    sdf, valid = evaluate_alpha_cull(points, views, gaussians, pipeline, kernel_size)
 
     torch.cuda.empty_cache()
     # the function marching_tetrahedra costs much memory, so we move it to cpu.
     if move_cpu:
         verts_list, scale_list, faces_list, _ = marching_tetrahedra(
-            points.cpu()[None], cells.cpu().long(), sdf[None].cpu(), points_scale[None].cpu(), valid[None].cpu()
+            points.cpu()[None],
+            cells.cpu().long(),
+            sdf[None].cpu(),
+            points_scale[None].cpu(),
+            valid[None].cpu(),
         )
     else:
-        verts_list, scale_list, faces_list, _ = marching_tetrahedra(points[None], cells.long(), sdf[None], points_scale[None], valid[None])
+        verts_list, scale_list, faces_list, _ = marching_tetrahedra(
+            points[None], cells.long(), sdf[None], points_scale[None], valid[None]
+        )
     end_points, end_sdf = verts_list[0]
     end_scales = scale_list[0]
-    end_points, end_sdf, end_scales = end_points.cuda(), end_sdf.cuda(), end_scales.cuda()
+    end_points, end_sdf, end_scales = (
+        end_points.cuda(),
+        end_sdf.cuda(),
+        end_scales.cuda(),
+    )
 
     faces = faces_list[0].cpu().numpy()
     points = (end_points[:, 0, :] + end_points[:, 1, :]) * 0.5
@@ -153,42 +251,90 @@ def marching_tetrahedra_with_binary_search(model_path, views, gaussians, pipelin
     for step in range(n_binary_steps):
         print("binary search in step {}".format(step))
         mid_points = (left_points + right_points) * 0.5
-        mid_sdf, _ = evaluage_alpha_cull(mid_points, views, gaussians, pipeline, kernel_size)
+        mid_sdf, _ = evaluate_alpha_cull(
+            mid_points, views, gaussians, pipeline, kernel_size
+        )
         mid_sdf = mid_sdf.unsqueeze(-1)
         ind_low = ((mid_sdf < 0) & (left_sdf < 0)) | ((mid_sdf > 0) & (left_sdf > 0))
         left_sdf[ind_low] = mid_sdf[ind_low]
         right_sdf[~ind_low] = mid_sdf[~ind_low]
         left_points[ind_low.flatten()] = mid_points[ind_low.flatten()]
         right_points[~ind_low.flatten()] = mid_points[~ind_low.flatten()]
-        points = (left_points + right_points) * 0.5
 
+    points = (left_points + right_points) * 0.5
     mesh = trimesh.Trimesh(vertices=points.cpu().numpy(), faces=faces, process=False)
     vertice_mask = distance <= scale
-    face_mask = vertice_mask.cpu().numpy()[faces].all(axis=1) 
+    face_mask = vertice_mask.cpu().numpy()[faces].all(axis=1)
     mesh.update_faces(face_mask)
     mesh.remove_unreferenced_vertices()
 
     mesh.export(os.path.join(model_path, "recon.ply"))
 
     o3d_mesh = o3d.geometry.TriangleMesh()
-    o3d_mesh.vertices = o3d.utility.Vector3dVector(np.asarray(mesh.vertices, dtype=np.float64))
-    o3d_mesh.triangles = o3d.utility.Vector3iVector(np.asarray(mesh.faces, dtype=np.int32))
+    o3d_mesh.vertices = o3d.utility.Vector3dVector(
+        np.asarray(mesh.vertices, dtype=np.float64)
+    )
+    o3d_mesh.triangles = o3d.utility.Vector3iVector(
+        np.asarray(mesh.faces, dtype=np.int32)
+    )
 
     print("remove flyers")
-    mesh = post_process_mesh(o3d_mesh, 1)
+    mesh = post_process_mesh(o3d_mesh, num_cluster)
+
+    if export_color:
+        print("add color")
+        max_dist = 0.008
+        v_np = np.asarray(mesh.vertices)
+        v_np = torch.from_numpy(v_np).to("cuda", dtype=torch.float32)
+        color, surface = add_color(
+            v_np, views, gaussians, pipeline, kernel_size, background, max_dist
+        )
+        color[~surface], surface[~surface] = add_color(
+            v_np[~surface],
+            views,
+            gaussians,
+            pipeline,
+            kernel_size,
+            background,
+            max_dist * 2,
+        )
+        # A simple coloring step for points likely on the silhouette cone.
+        color[~surface] = add_color_silhouette(
+            v_np[~surface], views, gaussians, pipeline, kernel_size, background
+        )
+        mesh.vertex_colors = o3d.utility.Vector3dVector(color.cpu().numpy())
+
     o3d.io.write_triangle_mesh(os.path.join(model_path, "recon_post.ply"), mesh)
     print("done!")
 
 
-
-def extract_mesh(dataset: ModelParams, iteration: int, pipeline: PipelineParams, move_cpu: bool, num_cluster: int):
+def extract_mesh(
+    dataset: ModelParams,
+    iteration: int,
+    pipeline: PipelineParams,
+    export_color: bool,
+    move_cpu: bool,
+    num_cluster: int,
+):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree, dataset.sg_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         kernel_size = dataset.kernel_size
+        bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
         cams = scene.getTrainCameras()
-        marching_tetrahedra_with_binary_search(dataset.model_path, cams, gaussians, pipeline, kernel_size, move_cpu, num_cluster)
+        marching_tetrahedra_with_binary_search(
+            dataset.model_path,
+            cams,
+            gaussians,
+            pipeline,
+            kernel_size,
+            background,
+            export_color,
+            move_cpu,
+            num_cluster,
+        )
 
 
 if __name__ == "__main__":
@@ -199,6 +345,14 @@ if __name__ == "__main__":
     parser.add_argument("--num_cluster", default=1, type=int)
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--move_cpu", action="store_true")
+    parser.add_argument("--export_color", action="store_true")
     args = get_combined_args(parser)
 
-    extract_mesh(model.extract(args), args.iteration, pipeline.extract(args), args.move_cpu, args.num_cluster)
+    extract_mesh(
+        model.extract(args),
+        args.iteration,
+        pipeline.extract(args),
+        args.export_color,
+        args.move_cpu,
+        args.num_cluster,
+    )

@@ -126,7 +126,6 @@ def unbatched_marching_tetrahedra(vertices, tets, sdf, scales, valids):
             # -------- merge into existing (keys_merged sorted unique) --------
             M = keys_merged.numel()
             V = keys_new.numel()
-            print(M)
 
             # find existing edges
             pos = torch.searchsorted(keys_merged, keys_new)  # (V,)

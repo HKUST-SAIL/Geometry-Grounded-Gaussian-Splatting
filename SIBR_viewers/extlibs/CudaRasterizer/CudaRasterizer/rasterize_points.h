@@ -87,7 +87,7 @@ torch::Tensor markVisible(
     torch::Tensor& projmatrix);
 
 std::tuple<int, torch::Tensor, torch::Tensor>
-IntegrateGaussiansToPointsCUDA(
+evaluateTransmittancefromSingleView(
     const torch::Tensor& points3D,
     const torch::Tensor& means3D,
     const torch::Tensor& opacity,
@@ -95,7 +95,6 @@ IntegrateGaussiansToPointsCUDA(
     const torch::Tensor& rotations,
     const float scale_modifier,
     const torch::Tensor& cov3D_precomp,
-    const torch::Tensor& view2gaussian_precomp,
     const torch::Tensor& viewmatrix,
     const torch::Tensor& projmatrix,
     const float tan_fovx,
@@ -116,7 +115,34 @@ evaluateSDFfromSingleView(
     const torch::Tensor& rotations,
     const float scale_modifier,
     const torch::Tensor& cov3D_precomp,
-    const torch::Tensor& view2gaussian_precomp,
+    const torch::Tensor& viewmatrix,
+    const torch::Tensor& projmatrix,
+    const float tan_fovx,
+    const float tan_fovy,
+    const float kernel_size,
+    const int image_height,
+    const int image_width,
+    const torch::Tensor& campos,
+    const bool prefiltered,
+    const bool debug);
+
+std::tuple<int, torch::Tensor, torch::Tensor>
+evaluateColorfromSingleView(
+    const torch::Tensor& points3D,
+    const torch::Tensor& background,
+    const torch::Tensor& means3D,
+    const torch::Tensor& colors,
+    const torch::Tensor& opacity,
+    const torch::Tensor& scales,
+    const torch::Tensor& rotations,
+    const torch::Tensor& cov3D_precomp,
+    const torch::Tensor& sh,
+    const torch::Tensor& sg_axis,
+    const torch::Tensor& sg_sharpness,
+    const torch::Tensor& sg_color,
+    const int sh_degree,
+    const int sg_degree,
+    const float scale_modifier,
     const torch::Tensor& viewmatrix,
     const torch::Tensor& projmatrix,
     const float tan_fovx,

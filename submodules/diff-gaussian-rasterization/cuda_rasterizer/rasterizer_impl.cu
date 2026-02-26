@@ -27,10 +27,10 @@
 namespace cg = cooperative_groups;
 
 #include "auxiliary.h"
-#include "render_forward.h"
 #include "render_backward.h"
-#include "sample_forward.h"
+#include "render_forward.h"
 #include "sample_backward.h"
+#include "sample_forward.h"
 
 // Helper function to find the next-highest bit of the MSB
 // on the CPU.
@@ -607,7 +607,6 @@ int CudaRasterizer::Rasterizer::evaluateTransmittance(
     const float scale_modifier,
     const float* rotations,
     const float* cov3D_precomp,
-    const float* depths_plane_precomp,
     const float* viewmatrix,
     const float* projmatrix,
     const float* cam_pos,
@@ -617,7 +616,6 @@ int CudaRasterizer::Rasterizer::evaluateTransmittance(
     const bool prefiltered,
     float* out_transmittance,
     bool* inside,
-    bool* condition,
     bool debug) {
     const float focal_y = height / (2.0f * tan_fovy);
     const float focal_x = width / (2.0f * tan_fovx);
@@ -663,8 +661,7 @@ int CudaRasterizer::Rasterizer::evaluateTransmittance(
                    geomState.conic_opacity,
                    tile_grid,
                    geomState.tiles_touched,
-                   prefiltered,
-                   condition),
+                   prefiltered),
                debug)
 
     // Compute prefix sum over full list of touched tile counts by Gaussians
@@ -830,7 +827,6 @@ int CudaRasterizer::Rasterizer::evaluateSDF(
     const float scale_modifier,
     const float* rotations,
     const float* cov3D_precomp,
-    const float* depths_plane_precomp,
     const float* viewmatrix,
     const float* projmatrix,
     const float* cam_pos,
@@ -841,7 +837,6 @@ int CudaRasterizer::Rasterizer::evaluateSDF(
     float* out_depth,
     float* out_sdf,
     bool* inside,
-    bool* condition,
     bool debug) {
     const float focal_y = height / (2.0f * tan_fovy);
     const float focal_x = width / (2.0f * tan_fovx);
@@ -888,8 +883,7 @@ int CudaRasterizer::Rasterizer::evaluateSDF(
                    geomState.conic_opacity,
                    tile_grid,
                    geomState.tiles_touched,
-                   prefiltered,
-                   condition),
+                   prefiltered),
                debug)
 
     // Compute prefix sum over full list of touched tile counts by Gaussians
@@ -1036,6 +1030,229 @@ int CudaRasterizer::Rasterizer::evaluateSDF(
                    inside),
                debug)
 
+    return num_rendered;
+}
+
+int CudaRasterizer::Rasterizer::evaluateColor(
+    std::function<char*(size_t)> geometryBuffer,
+    std::function<char*(size_t)> binningBuffer,
+    std::function<char*(size_t)> pointBuffer,
+    std::function<char*(size_t)> point_binningBuffer,
+    std::function<char*(size_t)> tileBuffer,
+    std::function<char*(size_t)> duplicatedTileBuffer,
+    const int PN, const int P,
+    const int SHD, const int SHM, const int SGD, const int SGM,
+    const float* background,
+    const int width, const int height,
+    const float* points3D,
+    const float* means3D,
+    const float* colors_precomp,
+    const float* opacities,
+    const float* scales,
+    const float* rotations,
+    const float* cov3D_precomp,
+    const float* shs,
+    const float* sg_axis,
+    const float* sg_sharpness,
+    const float* sg_color,
+    const float scale_modifier,
+    const float* viewmatrix,
+    const float* projmatrix,
+    const float* cam_pos,
+    const float tan_fovx,
+    const float tan_fovy,
+    const float kernel_size,
+    const bool prefiltered,
+    float* out_color,
+    bool* inside,
+    bool debug) {
+    const float focal_y = height / (2.0f * tan_fovy);
+    const float focal_x = width / (2.0f * tan_fovx);
+
+    size_t chunk_size       = required<GeometryState>(P);
+    char* chunkptr          = geometryBuffer(chunk_size);
+    GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
+
+    dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
+    const int tiles = tile_grid.x * tile_grid.y;
+
+    // Dynamically resize image-based auxiliary buffers during training
+    size_t tile_chunk_size    = required<TileState<true>>(tiles);
+    char* tile_chunkptr       = tileBuffer(tile_chunk_size);
+    TileState<true> tileState = TileState<true>::fromChunk(tile_chunkptr, tiles);
+    // Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
+    CHECK_CUDA(FORWARD::preprocess(
+                   P, SHD, SHM, SGD, SGM,
+                   means3D,
+                   colors_precomp,
+                   opacities,
+                   (glm::vec3*)scales,
+                   (float4*)rotations,
+                   cov3D_precomp,
+                   shs,
+                   sg_axis,
+                   sg_sharpness,
+                   sg_color,
+                   scale_modifier,
+                   viewmatrix, projmatrix,
+                   (glm::vec3*)cam_pos,
+                   width, height,
+                   focal_x, focal_y,
+                   tan_fovx, tan_fovy,
+                   kernel_size,
+                   geomState.internal_radii,
+                   geomState.clamped,
+                   geomState.means2D,
+                   geomState.depths,
+                   geomState.ray_planes,
+                   geomState.normals,
+                   geomState.rgb,
+                   geomState.conic_opacity,
+                   tile_grid,
+                   geomState.tiles_touched,
+                   prefiltered),
+               debug)
+    // Compute prefix sum over full list of touched tile counts by Gaussians
+    // E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
+    CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
+
+    // Retrieve total number of Gaussian instances to launch and resize aux buffers
+    int num_rendered;
+    CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+
+    size_t binning_chunk_size = required<BinningState>(num_rendered);
+    char* binning_chunkptr    = binningBuffer(binning_chunk_size);
+    BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
+
+    // For each instance to be rendered, produce adequate [ tile | depth ] key
+    // and corresponding dublicated Gaussian indices to be sorted
+    duplicateWithKeys<<<(P + 255) / 256, 256>>>(
+        P,
+        geomState.means2D,
+        geomState.depths,
+        geomState.point_offsets,
+        binningState.point_list_keys_unsorted,
+        binningState.point_list_unsorted,
+        geomState.internal_radii,
+        tile_grid)
+        CHECK_CUDA(, debug);
+
+    int bit = getHigherMsb(tiles);
+
+    // Sort complete list of (duplicated) Gaussian indices by keys
+    CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
+                   binningState.list_sorting_space,
+                   binningState.sorting_size,
+                   binningState.point_list_keys_unsorted, binningState.point_list_keys,
+                   binningState.point_list_unsorted, binningState.point_list,
+                   num_rendered, 0, 32 + bit),
+               debug)
+
+    CHECK_CUDA(cudaMemset(tileState.gaussian_ranges, 0, tiles * sizeof(uint2)), debug);
+
+    // Identify start and end of per-tile workloads in sorted list
+    if (num_rendered > 0)
+        identifyTileRanges<<<(num_rendered + 255) / 256, 256>>>(
+            num_rendered,
+            binningState.point_list_keys,
+            tileState.gaussian_ranges);
+    CHECK_CUDA(, debug)
+
+    // create a list of points similar to the list of gaussians
+    size_t point_chunk_size = required<PointState>(PN);
+    char* point_chunkptr    = pointBuffer(point_chunk_size);
+    PointState pointState   = PointState::fromChunk(point_chunkptr, PN);
+
+    // Run preprocessing per-Point (transformation)
+    CHECK_CUDA(FORWARD::preprocess_points(
+                   PN,
+                   points3D,
+                   viewmatrix, projmatrix,
+                   (glm::vec3*)cam_pos,
+                   width, height,
+                   focal_x, focal_y,
+                   tan_fovx, tan_fovy,
+                   pointState.points2D,
+                   pointState.depths,
+                   tile_grid,
+                   pointState.tiles_touched,
+                   prefiltered),
+               debug)
+
+    // Compute prefix sum over full list of touched tile counts by Gaussians
+    // E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
+    CHECK_CUDA(cub::DeviceScan::InclusiveSum(pointState.scanning_space, pointState.scan_size, pointState.tiles_touched, pointState.point_offsets, PN), debug)
+
+    // Retrieve total number of Point instances to launch and resize aux buffers
+    int num_evaluation;
+    CHECK_CUDA(cudaMemcpy(&num_evaluation, pointState.point_offsets + PN - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+
+    size_t point_binning_chunk_size = required<BinningState>(num_evaluation);
+    char* point_binning_chunkptr    = point_binningBuffer(point_binning_chunk_size);
+    BinningState point_binningState = BinningState::fromChunk(point_binning_chunkptr, num_evaluation);
+
+    // For each point to be integrated, produce adequate [ tile | depth ] key
+    // and corresponding Point indices to be sorted
+    createWithKeys<<<(PN + 255) / 256, 256>>>(
+        PN,
+        pointState.points2D,
+        pointState.depths,
+        pointState.point_offsets,
+        pointState.tiles_touched,
+        point_binningState.point_list_keys_unsorted,
+        point_binningState.point_list_unsorted,
+        tile_grid);
+    CHECK_CUDA(, debug)
+
+    //  Sort complete list of (duplicated) Gaussian indices by keys
+    CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
+                   point_binningState.list_sorting_space,
+                   point_binningState.sorting_size,
+                   point_binningState.point_list_keys_unsorted, point_binningState.point_list_keys,
+                   point_binningState.point_list_unsorted, point_binningState.point_list,
+                   num_evaluation, 0, 32 + bit),
+               debug)
+
+    CHECK_CUDA(cudaMemset(tileState.point_ranges, 0, tiles * sizeof(uint2)), debug);
+
+    // Identify start and end of per-tile workloads in sorted list
+    if (num_evaluation > 0)
+        identifyTileRanges<<<(num_evaluation + 255) / 256, 256>>>(
+            num_evaluation,
+            point_binningState.point_list_keys,
+            tileState.point_ranges);
+    CHECK_CUDA(, debug)
+
+    countPointBatches<<<(tiles + 255) / 256, 256>>>(tiles, tileState.point_ranges, tileState.tile_rounds);
+    CHECK_CUDA(, debug)
+    CHECK_CUDA(cub::DeviceScan::InclusiveSum(tileState.scanning_space, tileState.scan_size, tileState.tile_rounds, tileState.tile_offsets, tiles), debug);
+    int num_duplicated_tiles;
+    CHECK_CUDA(cudaMemcpy(&num_duplicated_tiles, tileState.tile_offsets + tiles - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+    size_t dup_tile_chunk_size                = required<DuplicatedTileState>(num_duplicated_tiles);
+    char* dup_tile_chunkptr                   = duplicatedTileBuffer(dup_tile_chunk_size);
+    DuplicatedTileState duplicated_tile_state = DuplicatedTileState::fromChunk(dup_tile_chunkptr, num_duplicated_tiles);
+    setBlockId<<<(tiles + 255) / 256, 256>>>(tiles, tileState.tile_offsets, tileState.tile_rounds, duplicated_tile_state.tile_id);
+    CHECK_CUDA(, debug)
+
+    CHECK_CUDA(FORWARD::evaluateColor(
+                   num_duplicated_tiles,
+                   duplicated_tile_state.tile_id,
+                   tileState.tile_offsets,
+                   tileState.gaussian_ranges,
+                   tileState.point_ranges,
+                   binningState.point_list,
+                   point_binningState.point_list,
+                   width, height,
+                   focal_x, focal_y,
+                   pointState.points2D,
+                   pointState.depths,
+                   geomState.means2D,
+                   geomState.conic_opacity,
+                   geomState.rgb,
+                   background,
+                   out_color,
+                   inside),
+               debug)
     return num_rendered;
 }
 

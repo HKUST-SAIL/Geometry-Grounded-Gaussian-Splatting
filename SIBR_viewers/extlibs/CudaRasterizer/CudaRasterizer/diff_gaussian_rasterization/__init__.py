@@ -233,15 +233,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 grad_scales,
                 grad_rotations,
             ) = _C.rasterize_gaussians_backward(*args)
-        assert not torch.isnan(grad_means2D).any()
-        assert not torch.isnan(grad_opacities).any()
-        assert not torch.isnan(grad_means3D).any()
-        assert not torch.isnan(grad_sh).any()
-        assert not torch.isnan(grad_scales).any()
-        assert not torch.isnan(grad_rotations).any()
-        assert not torch.isnan(grad_sg_axis).any()
-        assert not torch.isnan(grad_sg_sharpness).any()
-        assert not torch.isnan(grad_sg_color).any()
+
         grads = (
             grad_means3D,
             grad_means2D,
@@ -302,7 +294,7 @@ class GaussianRasterizer(nn.Module):
         colors_precomp=None,
         scales=None,
         rotations=None,
-        cov3D_precomp=None,
+        cov3Ds_precomp=None,
     ):
 
         raster_settings = self.raster_settings
@@ -310,8 +302,8 @@ class GaussianRasterizer(nn.Module):
         if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):
             raise Exception("Please provide excatly one of either SHs or precomputed colors!")
 
-        if ((scales is None or rotations is None) and cov3D_precomp is None) or (
-            (scales is not None or rotations is not None) and cov3D_precomp is not None
+        if ((scales is None or rotations is None) and cov3Ds_precomp is None) or (
+            (scales is not None or rotations is not None) and cov3Ds_precomp is not None
         ):
             raise Exception("Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!")
 
@@ -324,8 +316,8 @@ class GaussianRasterizer(nn.Module):
             scales = torch.Tensor([])
         if rotations is None:
             rotations = torch.Tensor([])
-        if cov3D_precomp is None:
-            cov3D_precomp = torch.Tensor([])
+        if cov3Ds_precomp is None:
+            cov3Ds_precomp = torch.Tensor([])
 
         # Invoke C++/CUDA rasterization routine
         return rasterize_gaussians(
@@ -339,25 +331,24 @@ class GaussianRasterizer(nn.Module):
             opacities,
             scales,
             rotations,
-            cov3D_precomp,
+            cov3Ds_precomp,
             raster_settings,
         )
 
-    def integrate(
+    def evaluate_transmittance(
         self,
         points3D,
         means3D,
         opacities,
         scales=None,
         rotations=None,
-        cov3D_precomp=None,
-        view2gaussian_precomp=None,
+        cov3Ds_precomp=None,
     ):
 
         raster_settings = self.raster_settings
 
-        if ((scales is None or rotations is None) and cov3D_precomp is None) or (
-            (scales is not None or rotations is not None) and cov3D_precomp is not None
+        if ((scales is None or rotations is None) and cov3Ds_precomp is None) or (
+            (scales is not None or rotations is not None) and cov3Ds_precomp is not None
         ):
             raise Exception("Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!")
 
@@ -365,12 +356,8 @@ class GaussianRasterizer(nn.Module):
             scales = torch.Tensor([])
         if rotations is None:
             rotations = torch.Tensor([])
-        if cov3D_precomp is None:
-            cov3D_precomp = torch.Tensor([])
-
-        # TODO check and raise exception for precomputed view2gaussian
-        if view2gaussian_precomp is None:
-            view2gaussian_precomp = torch.Tensor([])
+        if cov3Ds_precomp is None:
+            cov3Ds_precomp = torch.Tensor([])
 
         # Invoke C++/CUDA rasterization routine
         # Restructure arguments the way that the C++ lib expects them
@@ -381,8 +368,7 @@ class GaussianRasterizer(nn.Module):
             scales,
             rotations,
             raster_settings.scale_modifier,
-            cov3D_precomp,
-            view2gaussian_precomp,
+            cov3Ds_precomp,
             raster_settings.viewmatrix,
             raster_settings.projmatrix,
             raster_settings.tanfovx,
@@ -399,15 +385,15 @@ class GaussianRasterizer(nn.Module):
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args)  # Copy them before they can be corrupted
             try:
-                num_rendered, transmittance, inside = _C.integrate_gaussians_to_points(*args)
+                num_rendered, transmittance, inside = _C.evaluate_transmittance_from_signle_view(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_fw.dump")
                 print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
                 raise ex
         else:
-            num_rendered, transmittance, inside = _C.integrate_gaussians_to_points(*args)
+            num_rendered, transmittance, inside = _C.evaluate_transmittance_from_signle_view(*args)
 
-        return 1 - transmittance, inside
+        return transmittance, inside
 
     def evaluate_sdf(
         self,
@@ -416,14 +402,13 @@ class GaussianRasterizer(nn.Module):
         opacities,
         scales=None,
         rotations=None,
-        cov3D_precomp=None,
-        view2gaussian_precomp=None,
+        cov3Ds_precomp=None,
     ):
 
         raster_settings = self.raster_settings
 
-        if ((scales is None or rotations is None) and cov3D_precomp is None) or (
-            (scales is not None or rotations is not None) and cov3D_precomp is not None
+        if ((scales is None or rotations is None) and cov3Ds_precomp is None) or (
+            (scales is not None or rotations is not None) and cov3Ds_precomp is not None
         ):
             raise Exception("Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!")
 
@@ -431,12 +416,8 @@ class GaussianRasterizer(nn.Module):
             scales = torch.Tensor([])
         if rotations is None:
             rotations = torch.Tensor([])
-        if cov3D_precomp is None:
-            cov3D_precomp = torch.Tensor([])
-
-        # TODO check and raise exception for precomputed view2gaussian
-        if view2gaussian_precomp is None:
-            view2gaussian_precomp = torch.Tensor([])
+        if cov3Ds_precomp is None:
+            cov3Ds_precomp = torch.Tensor([])
 
         # Invoke C++/CUDA rasterization routine
         # Restructure arguments the way that the C++ lib expects them
@@ -447,8 +428,7 @@ class GaussianRasterizer(nn.Module):
             scales,
             rotations,
             raster_settings.scale_modifier,
-            cov3D_precomp,
-            view2gaussian_precomp,
+            cov3Ds_precomp,
             raster_settings.viewmatrix,
             raster_settings.projmatrix,
             raster_settings.tanfovx,
@@ -474,10 +454,90 @@ class GaussianRasterizer(nn.Module):
             num_rendered, depth, sdf, inside = _C.evaluate_sdf_from_signle_view(*args)
 
         return depth, sdf, inside
+    
+    def evaluate_color(
+        self,
+        points3D,
+        means3D,
+        shs,
+        sg_axis,
+        sg_sharpness,
+        sg_color,
+        colors_precomp,
+        opacities,
+        scales,
+        rotations,
+        cov3Ds_precomp,
+    ):
+        raster_settings = self.raster_settings
 
-    def sample_depth(self, points3D, means3D, opacities, scales=None, rotations=None, cov3D_precomp=None):
-        if ((scales is None or rotations is None) and cov3D_precomp is None) or (
-            (scales is not None or rotations is not None) and cov3D_precomp is not None
+        if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):
+            raise Exception("Please provide excatly one of either SHs or precomputed colors!")
+
+        if ((scales is None or rotations is None) and cov3Ds_precomp is None) or (
+            (scales is not None or rotations is not None) and cov3Ds_precomp is not None
+        ):
+            raise Exception("Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!")
+
+        if shs is None:
+            shs = torch.Tensor([])
+        if colors_precomp is None:
+            colors_precomp = torch.Tensor([])
+
+        if scales is None:
+            scales = torch.Tensor([])
+        if rotations is None:
+            rotations = torch.Tensor([])
+        if cov3Ds_precomp is None:
+            cov3Ds_precomp = torch.Tensor([])
+
+        # Invoke C++/CUDA rasterization routine
+        # Restructure arguments the way that the C++ lib expects them
+        args = (
+            points3D,
+            raster_settings.bg,
+            means3D,
+            colors_precomp,
+            opacities,
+            scales,
+            rotations,
+            cov3Ds_precomp,
+            shs,
+            sg_axis,
+            sg_sharpness,
+            sg_color,
+            raster_settings.sh_degree,
+            raster_settings.sg_degree,
+            raster_settings.scale_modifier,
+            raster_settings.viewmatrix,
+            raster_settings.projmatrix,
+            raster_settings.tanfovx,
+            raster_settings.tanfovy,
+            0.0,
+            raster_settings.image_height,
+            raster_settings.image_width,
+            raster_settings.campos,
+            raster_settings.prefiltered,
+            raster_settings.debug,
+        )
+
+        # Invoke C++/CUDA rasterizer
+        if raster_settings.debug:
+            cpu_args = cpu_deep_copy_tuple(args)  # Copy them before they can be corrupted
+            try:
+                num_rendered, color, inside = _C.evaluate_color_from_signle_view(*args)
+            except Exception as ex:
+                torch.save(cpu_args, "snapshot_fw.dump")
+                print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
+                raise ex
+        else:
+            num_rendered, color, inside = _C.evaluate_color_from_signle_view(*args)
+
+        return color, inside
+
+    def sample_depth(self, points3D, means3D, opacities, scales=None, rotations=None, cov3Ds_precomp=None):
+        if ((scales is None or rotations is None) and cov3Ds_precomp is None) or (
+            (scales is not None or rotations is not None) and cov3Ds_precomp is not None
         ):
             raise Exception("Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!")
 
@@ -485,10 +545,10 @@ class GaussianRasterizer(nn.Module):
             scales = torch.Tensor([])
         if rotations is None:
             rotations = torch.Tensor([])
-        if cov3D_precomp is None:
-            cov3D_precomp = torch.Tensor([])
+        if cov3Ds_precomp is None:
+            cov3Ds_precomp = torch.Tensor([])
         raster_settings = self.raster_settings
-        return _SampleDepth.apply(points3D, means3D, opacities, scales, rotations, cov3D_precomp, raster_settings)
+        return _SampleDepth.apply(points3D, means3D, opacities, scales, rotations, cov3Ds_precomp, raster_settings)
 
 
 class _SampleDepth(torch.autograd.Function):
@@ -500,7 +560,7 @@ class _SampleDepth(torch.autograd.Function):
         opacities,
         scales,
         rotations,
-        cov3D_precomp,
+        cov3Ds_precomp,
         raster_settings,
     ):
 
@@ -513,7 +573,7 @@ class _SampleDepth(torch.autograd.Function):
             scales,
             rotations,
             raster_settings.scale_modifier,
-            cov3D_precomp,
+            cov3Ds_precomp,
             raster_settings.viewmatrix,
             raster_settings.projmatrix,
             raster_settings.tanfovx,
@@ -572,7 +632,7 @@ class _SampleDepth(torch.autograd.Function):
             opacities,
             scales,
             rotations,
-            cov3D_precomp,
+            cov3Ds_precomp,
             inside,
             geomBuffer,
             binningBuffer,
@@ -595,7 +655,7 @@ class _SampleDepth(torch.autograd.Function):
             opacities,
             scales,
             rotations,
-            cov3D_precomp,
+            cov3Ds_precomp,
             inside,
             geomBuffer,
             binningBuffer,
@@ -613,7 +673,7 @@ class _SampleDepth(torch.autograd.Function):
             scales,
             rotations,
             raster_settings.scale_modifier,
-            cov3D_precomp,
+            cov3Ds_precomp,
             raster_settings.viewmatrix,
             raster_settings.projmatrix,
             inside,
@@ -641,7 +701,7 @@ class _SampleDepth(torch.autograd.Function):
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args)  # Copy them before they can be corrupted
             try:
-                grad_opacities, grad_means3D, grad_cov3D_precomp, grad_scales, grad_rotations, grad_points3D = _C.sample_rasterized_depth_backward(
+                grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_scales, grad_rotations, grad_points3D = _C.sample_rasterized_depth_backward(
                     *args
                 )
             except Exception as ex:
@@ -649,7 +709,7 @@ class _SampleDepth(torch.autograd.Function):
                 print("\nAn error occured in backward. Writing snapshot_bw.dump for debugging.\n")
                 raise ex
         else:
-            grad_opacities, grad_means3D, grad_cov3D_precomp, grad_scales, grad_rotations, grad_points3D = _C.sample_rasterized_depth_backward(*args)
+            grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_scales, grad_rotations, grad_points3D = _C.sample_rasterized_depth_backward(*args)
 
         grads = (
             grad_points3D,
@@ -657,7 +717,7 @@ class _SampleDepth(torch.autograd.Function):
             grad_opacities,
             grad_scales,
             grad_rotations,
-            grad_cov3D_precomp,
+            grad_cov3Ds_precomp,
             None,
         )
         return grads

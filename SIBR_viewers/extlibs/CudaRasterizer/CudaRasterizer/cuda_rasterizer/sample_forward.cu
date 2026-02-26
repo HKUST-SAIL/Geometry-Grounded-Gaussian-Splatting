@@ -1,4 +1,5 @@
 #include "auxiliary.h"
+#include "config.h"
 #include "sample_forward.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
@@ -52,7 +53,7 @@ __global__ void preprocessPointsCUDA(
     tiles_touched[idx] = 1;
 }
 
-template <uint32_t CHANNELS, int SAMPLES_PRE_ROUND>
+template <int SAMPLES_PRE_ROUND>
 __global__ void __launch_bounds__(BLOCK_SIZE)
     evaluateTransmittanceCUDA(
         const uint32_t* __restrict__ tile_ids,
@@ -316,8 +317,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 #else
         float mDepthinit = Depth[p];
 #endif
-        depth_min[p] = fmaxf(mDepthinit - SAMPLE_RANGE * 2.f, 0.f);
-        depth_max[p] = fmaxf(mDepthinit + SAMPLE_RANGE * 2.f, 0.f);
+        depth_min[p] = fmaxf(mDepthinit - SAMPLE_RANGE_TESTING * 2.f, 0.f);
+        depth_max[p] = fmaxf(mDepthinit + SAMPLE_RANGE_TESTING * 2.f, 0.f);
     }
     float T_p[SAMPLES_PRE_ROUND][SPLIT + 1];
     bool inside_range[SAMPLES_PRE_ROUND] = {false};
@@ -424,6 +425,122 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
         output[point_idx[p]]        = mDepth - point_ts[point_idx[p]];
         median_depth[point_idx[p]]  = mDepth;
         inside_output[point_idx[p]] = inside_range[p];
+    }
+}
+
+template <uint32_t CHANNELS, int SAMPLES_PRE_ROUND>
+__global__ void __launch_bounds__(BLOCK_SIZE)
+    evaluateColorCUDA(
+        const uint32_t* __restrict__ tile_ids,
+        const uint32_t* __restrict__ tile_offsets,
+        const uint2* __restrict__ gaussian_ranges,
+        const uint2* __restrict__ point_ranges,
+        const uint32_t* __restrict__ gaussian_list,
+        const uint32_t* __restrict__ point_list,
+        int W, int H,
+        float focal_x, float focal_y,
+        const float2* __restrict__ points2D,
+        const float* __restrict__ point_ts,
+        const float2* __restrict__ gaussians2D,
+        const float4* __restrict__ conic_opacity,
+        const float* __restrict__ colors,
+        const float* bg_color,
+        float* __restrict__ out_color,
+        bool* __restrict__ inside) {
+    auto block                 = cg::this_thread_block();
+    const uint32_t block_id    = block.group_index().x;
+    const int tile_id          = tile_ids[block_id];
+    const uint32_t tile_offset = (tile_id == 0) ? 0 : tile_offsets[tile_id - 1];
+    const int p_round          = block_id - tile_offset;
+    const uint2 p_range        = point_ranges[tile_id];
+
+    // Load start/end range of IDs to process in bit sorted list.
+    const uint2 range = gaussian_ranges[tile_id];
+    const int rounds  = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+    // Allocate storage for batches of collectively fetched data.
+    __shared__ float2 collected_xy[BLOCK_SIZE];
+    __shared__ float collected_color[BLOCK_SIZE * CHANNELS];
+    __shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+
+    bool done[SAMPLES_PRE_ROUND] = {false};
+    float C_point[SAMPLES_PRE_ROUND][CHANNELS];
+    float T_gaussian[SAMPLES_PRE_ROUND];
+    uint32_t point_idx[SAMPLES_PRE_ROUND];
+    float2 point_xy[SAMPLES_PRE_ROUND];
+    float point_t[SAMPLES_PRE_ROUND];
+    int point_done      = 0;
+    int point_num_round = 0;
+    for (int p = 0; p < SAMPLES_PRE_ROUND; p++) {
+        int progress = (p_round * SAMPLES_PRE_ROUND + p) * BLOCK_SIZE + block.thread_rank();
+        if (p_range.x + progress < p_range.y) {
+#pragma unroll
+            for (int ch = 0; ch < CHANNELS; ch++)
+                C_point[p][ch] = 0.f;
+            T_gaussian[p] = 1.f;
+            int pid       = point_list[p_range.x + progress];
+            point_idx[p]  = pid;
+            point_xy[p]   = points2D[pid];
+            point_t[p]    = point_ts[pid];
+            point_num_round++;
+        }
+    }
+    bool all_done = point_num_round == 0;
+    int toDo      = range.y - range.x;
+    for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE) {
+        // End if entire block votes that it is done rasterizing
+        int block_done = __syncthreads_and(all_done);
+        if (block_done)
+            break;
+
+        block.sync();
+        // Collectively fetch per-Gaussian data from global to shared
+        int progress = i * BLOCK_SIZE + block.thread_rank();
+        if (range.x + progress < range.y) {
+            int coll_id                                  = gaussian_list[range.x + progress];
+            collected_xy[block.thread_rank()]            = gaussians2D[coll_id];
+            collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+            for (int ch = 0; ch < CHANNELS; ch++)
+                collected_color[ch * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * CHANNELS + ch];
+        }
+        block.sync();
+
+        // Iterate over current batch
+        for (int j = 0; !all_done && j < min(BLOCK_SIZE, toDo); j++) {
+            const float2 xy    = collected_xy[j];
+            const float4 con_o = collected_conic_opacity[j];
+            for (int p = 0; p < point_num_round; p++) {
+                if (done[p])
+                    continue;
+                float2 d    = {xy.x - point_xy[p].x, xy.y - point_xy[p].y};
+                float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+                if (power > 0.0f) {
+                    continue;
+                }
+
+                const float alpha = fminf(0.99f, con_o.w * expf(power));
+                if (alpha < 1.0f / 255.0f)
+                    continue;
+                float test_T = T_gaussian[p] * (1.f - alpha);
+                if (test_T < 0.0001f) {
+                    done[p] = true;
+                    point_done++;
+                    continue;
+                }
+                float aT = T_gaussian[p] * alpha;
+#pragma unroll
+                for (int ch = 0; ch < CHANNELS; ch++)
+                    C_point[p][ch] += collected_color[j + BLOCK_SIZE * ch] * aT;
+                T_gaussian[p] = test_T;
+            }
+            all_done = point_done == point_num_round;
+        }
+    }
+    for (int p = 0; p < point_num_round; p++) {
+#pragma unroll
+        for (int ch = 0; ch < CHANNELS; ch++)
+            out_color[point_idx[p] * CHANNELS + ch] = C_point[p][ch] + T_gaussian[p] * bg_color[ch];
+        inside[point_idx[p]] = true;
     }
 }
 
@@ -749,7 +866,7 @@ void FORWARD::evaluateTransmittance(
     bool* inside) {
     if (num_duplicated_tiles == 0)
         return;
-    evaluateTransmittanceCUDA<NUM_CHANNELS, SAMPLE_BATCH_SIZE><<<num_duplicated_tiles, BLOCK_SIZE>>>(
+    evaluateTransmittanceCUDA<SAMPLE_BATCH_SIZE><<<num_duplicated_tiles, BLOCK_SIZE>>>(
         tile_ids,
         tile_offsets,
         gaussian_ranges,
@@ -789,7 +906,7 @@ void FORWARD::evaluateSDF(
     bool* inside_output) {
     if (num_duplicated_tiles == 0)
         return;
-    evaluateSDFCUDA<SAMPLE_BATCH_SIZE, SPLIT, SPLIT_ITERATIONS + 1><<<num_duplicated_tiles, BLOCK_SIZE>>>(
+    evaluateSDFCUDA<SAMPLE_BATCH_SIZE, SPLIT, SPLIT_ITERATIONS_TESTING><<<num_duplicated_tiles, BLOCK_SIZE>>>(
         tile_ids,
         tile_offsets,
         gaussian_ranges,
@@ -807,6 +924,45 @@ void FORWARD::evaluateSDF(
         median_depth,
         output,
         inside_output);
+}
+
+void FORWARD::evaluateColor(
+    const int num_duplicated_tiles,
+    const uint32_t* tile_ids,
+    const uint32_t* tile_offsets,
+    const uint2* gaussian_ranges,
+    const uint2* point_ranges,
+    const uint32_t* gaussian_list,
+    const uint32_t* point_list,
+    int W, int H,
+    float focal_x, float focal_y,
+    const float2* points2D,
+    const float* point_depths,
+    const float2* gaussians2D,
+    const float4* conic_opacity,
+    const float* colors,
+    const float* bg_color,
+    float* out_color,
+    bool* inside) {
+    if (num_duplicated_tiles == 0)
+        return;
+    evaluateColorCUDA<NUM_CHANNELS, SAMPLE_BATCH_SIZE><<<num_duplicated_tiles, BLOCK_SIZE>>>(
+        tile_ids,
+        tile_offsets,
+        gaussian_ranges,
+        point_ranges,
+        gaussian_list,
+        point_list,
+        W, H,
+        focal_x, focal_y,
+        points2D,
+        point_depths,
+        gaussians2D,
+        conic_opacity,
+        colors,
+        bg_color,
+        out_color,
+        inside);
 }
 
 void FORWARD::sampleDepth(

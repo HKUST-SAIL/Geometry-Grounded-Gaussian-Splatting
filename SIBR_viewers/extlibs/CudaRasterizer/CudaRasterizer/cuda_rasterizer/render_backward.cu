@@ -830,11 +830,11 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
     }
 
     [[maybe_unused]] float dL_dmt_dT_dtm = 0.f;
+    const int rounds     = (max_contributor + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     if constexpr (GEOMETRY) {
         float dT_dtm    = 0.f;
         int toDo        = max_contributor;
-        int rounds      = (max_contributor + BLOCK_SIZE - 1) / BLOCK_SIZE;
         int contributor = 0;
         bool done       = (mDepth == 0) || (last_contributor == 0) || !inside;
         // Iterate over batches until all done or range is complete
@@ -881,7 +881,6 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
 
     bool done            = !inside;
     int toDo             = max_contributor;
-    const int rounds     = (max_contributor + BLOCK_SIZE - 1) / BLOCK_SIZE;
     uint32_t contributor = toDo;
 
     float last_alpha                      = 0;

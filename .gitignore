@@ -31,3 +31,4 @@ CMakeCache.txt
 cmake.check_cache
 blender_scripts/
 .clangd
+debug.sh

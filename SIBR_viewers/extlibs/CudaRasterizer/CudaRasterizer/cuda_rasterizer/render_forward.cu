@@ -311,8 +311,7 @@ __global__ void preprocessCUDA(
     float4* conic_opacity,
     const dim3 grid,
     uint32_t* tiles_touched,
-    bool prefiltered,
-    bool* conditions) {
+    bool prefiltered) {
     auto idx = cg::this_grid().thread_rank();
     if (idx >= P)
         return;
@@ -737,8 +736,7 @@ void FORWARD::preprocess(
     float4* conic_opacity,
     const dim3 grid,
     uint32_t* tiles_touched,
-    bool prefiltered,
-    bool* condition) {
+    bool prefiltered) {
     preprocessCUDA<NUM_CHANNELS><<<(P + 255) / 256, 256>>>(
         P, SHD, SHM, SGD, SGM,
         means3D,
@@ -769,6 +767,5 @@ void FORWARD::preprocess(
         conic_opacity,
         grid,
         tiles_touched,
-        prefiltered,
-        condition);
+        prefiltered);
 }

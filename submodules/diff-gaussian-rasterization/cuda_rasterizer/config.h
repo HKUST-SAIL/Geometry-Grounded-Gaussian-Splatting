@@ -18,8 +18,6 @@
 #error "Must define exactly one of MEDIAN_DEPTH_INIT / MEAN_DEPTH_INIT / MOST_VISIBLE_INIT"
 #endif
 
-#define TRAINING 1
-
 constexpr int NUM_CHANNELS        = 3;
 constexpr int BLOCK_X             = 16;
 constexpr int BLOCK_Y             = 16;
@@ -30,13 +28,13 @@ constexpr float FAR_PLANE         = 100.f;
 constexpr float NORMALIZE_EPS     = 1.0E-12F;
 constexpr float MIN_TRANSMITTANCE = 0.45f;
 constexpr int SPLIT               = 8;
-#if TRAINING
+
 constexpr float SAMPLE_RANGE   = 0.4f;
 constexpr int SPLIT_ITERATIONS = 5;
-#else
-constexpr float SAMPLE_RANGE   = 10.f;
-constexpr int SPLIT_ITERATIONS = 7;
-#endif
+
+constexpr float SAMPLE_RANGE_TESTING   = 100.f;
+constexpr int SPLIT_ITERATIONS_TESTING = 8;
+
 
 
 #endif

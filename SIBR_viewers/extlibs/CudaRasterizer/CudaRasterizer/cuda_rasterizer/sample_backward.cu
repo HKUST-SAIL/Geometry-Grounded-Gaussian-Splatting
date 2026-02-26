@@ -169,7 +169,7 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
     float dT_dtm[SAMPLES_PRE_ROUND]        = {0.f};
     float dL_dmt_dT_dtm[SAMPLES_PRE_ROUND] = {0.f};
     int toDo                               = max_contributor;
-    const int rounds                       = (toDo + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int rounds                       = (max_contributor + BLOCK_SIZE - 1) / BLOCK_SIZE;
     uint32_t contributor                   = 0;
     // Traverse all Gaussians
     for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE) {

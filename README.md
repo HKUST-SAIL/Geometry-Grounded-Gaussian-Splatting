@@ -105,9 +105,13 @@ python evaluate_dtu_mesh.py -m <output_dir>
 # Training
 python train.py -s <path_to_preprocessed_tnt> -m <output_dir> -r 2 --use_decoupled_appearance 3
 
-# Mesh extraction (add --move_cpu to reduce GPU memory usage if needed)
+
+# Mesh extraction
+# Tips:
+#   - Add --move_cpu to reduce GPU memory usage (if needed).
+#   - Add --export_color to export the mesh with vertex colors.
 python mesh_extract_tetrahedra.py -m <output_dir> 
-# python mesh_extract_tetrahedra.py -m <output_dir> --move_cpu
+# python mesh_extract_tetrahedra.py -m <output_dir> --move_cpu --export_color
 
 # Evaluation
 python eval_tnt/run.py \

@@ -50,8 +50,7 @@ void preprocess(
     float4* conic_opacity,
     const dim3 grid,
     uint32_t* tiles_touched,
-    bool prefiltered = false,
-    bool* condition = nullptr);
+    bool prefiltered = false);
 
 // Main rasterization method.
 void render(
